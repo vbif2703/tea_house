@@ -1,0 +1,916 @@
+import os
+import time
+import random
+import sqlite3
+from functools import wraps
+from security import hash_password, verify_password
+from storage import RECIPES, default_stock, composition, can_make, consume, shortages, blocked_items
+
+HOUSE_NAME = "Чайный таун"
+DB_FILE = "tea_house.db"
+RECEIPT_SUFFIX = "_receipts.txt"
+ADMIN_LOGIN = "Admin"
+CEREMONY_SECTION = "Чайные церемонии"
+MINUTE_LENGTH = 1.0
+LAST_ORDERS_LIMIT = 5
+
+HALLS = {
+    "Зал Бамбук": 4,
+    "Зал Сакура": 6,
+    "Зал Луна": 2,
+    "Зал Дракон": 8,
+    "Зал Пион": 4,
+}
+
+default_menu = {
+    CEREMONY_SECTION: {
+        "Гунфу ча на улунах": (900, "гость", 60),
+        "Китайская церемония Пин Ча": (850, "гость", 45),
+        "Японская церемония Тяною": (1100, "гость", 75),
+        "Церемония с выдержанным пуэром": (950, "гость", 60),
+        "Церемония с белым чаем": (880, "гость", 50),
+        "Дегустация молочного улуна": (700, "гость", 40),
+        "Зеленый чай по-корейски": (820, "гость", 50),
+        "Вечерняя церемония при свечах": (1300, "гость", 90),
+    },
+    "Чай на дом": {
+        "Те Гуань Инь": (450, "50 г", 2),
+        "Да Хун Пао": (690, "50 г", 2),
+        "Молочный улун": (420, "50 г", 2),
+        "Дун Дин": (480, "50 г", 2),
+        "Шу пуэр 2015": (520, "50 г", 2),
+        "Шэн пуэр 2018": (560, "50 г", 2),
+        "Лао Ча Тоу": (610, "50 г", 2),
+        "Бай Му Дань": (470, "50 г", 2),
+        "Шоу Мэй": (380, "50 г", 2),
+        "Лун Цзин": (640, "50 г", 2),
+        "Би Ло Чунь": (660, "50 г", 2),
+        "Дянь Хун": (390, "50 г", 2),
+        "Цзинь Цзюнь Мэй": (890, "50 г", 2),
+        "Лапсанг Сушонг": (430, "50 г", 2),
+        "Жасминовый зеленый": (330, "50 г", 2),
+        "Иван-чай": (260, "50 г", 2),
+        "Каркаде": (220, "50 г", 2),
+        "Сенча": (520, "50 г", 2),
+    },
+    "Посуда для чая": {
+        "Гайвань 120 мл": (1200, "шт", 3),
+        "Исинский чайник 200 мл": (4500, "шт", 3),
+        "Стеклянный чайник 600 мл": (1800, "шт", 3),
+        "Чахай чаша справедливости": (1100, "шт", 3),
+        "Чабань бамбуковый": (3200, "шт", 3),
+        "Чайная доска с дренажом": (4200, "шт", 3),
+        "Набор пиал 6 шт": (1500, "набор", 3),
+        "Чайные пары вэньсян бэй": (1300, "набор", 3),
+        "Ситечко для чая": (450, "шт", 3),
+        "Чайная ложка ча-чи": (380, "шт", 3),
+        "Щипцы для пиал": (420, "шт", 3),
+        "Термос для чая 500 мл": (2100, "шт", 3),
+        "Банка для хранения чая": (690, "шт", 3),
+        "Подставка под чайник": (350, "шт", 3),
+    },
+    "Выпечка": {
+        "Слойка с яблоком": (160, "100 г", 8),
+        "Круассан": (180, "100 г", 8),
+        "Круассан с миндалем": (220, "100 г", 8),
+        "Булочка с корицей": (130, "100 г", 8),
+        "Синнабон": (240, "100 г", 10),
+        "Пирог с грушей": (210, "100 г", 10),
+        "Овсяное печенье": (90, "100 г", 4),
+        "Скон с изюмом": (150, "100 г", 7),
+        "Лимонный кекс": (140, "100 г", 6),
+        "Яблочный штрудель": (230, "100 г", 12),
+    },
+    "Сладости": {
+        "Чизкейк": (250, "100 г", 4),
+        "Тирамису": (270, "100 г", 4),
+        "Медовик": (230, "100 г", 4),
+        "Наполеон": (240, "100 г", 4),
+        "Шоколадный фондан": (280, "100 г", 12),
+        "Мороженое": (150, "100 г", 3),
+        "Моти ассорти": (260, "100 г", 4),
+        "Рахат-лукум": (180, "100 г", 3),
+        "Пахлава": (200, "100 г", 3),
+        "Мармелад ручной работы": (170, "100 г", 3),
+        "Горький шоколад 70 процентов": (190, "100 г", 3),
+    },
+    "Сухофрукты": {
+        "Курага": (140, "100 г", 2),
+        "Чернослив": (150, "100 г", 2),
+        "Светлый изюм": (110, "100 г", 2),
+        "Королевские финики": (190, "100 г", 2),
+        "Сушеный инжир": (210, "100 г", 2),
+        "Сушеное манго": (230, "100 г", 2),
+        "Вяленая клюква": (180, "100 г", 2),
+        "Яблочные чипсы": (120, "100 г", 2),
+    },
+    "Орехи": {
+        "Кешью": (220, "100 г", 2),
+        "Миндаль": (210, "100 г", 2),
+        "Грецкий орех": (190, "100 г", 2),
+        "Фисташки": (260, "100 г", 2),
+        "Пекан": (320, "100 г", 2),
+        "Макадамия": (380, "100 г", 2),
+        "Фундук": (230, "100 г", 2),
+        "Кедровый орех": (340, "100 г", 2),
+    },
+    "Сытные закуски": {
+        "Сэндвич с курицей": (280, "100 г", 10),
+        "Сэндвич с тунцом": (300, "100 г", 10),
+        "Киш лорен": (320, "100 г", 14),
+        "Пирог с капустой": (190, "100 г", 9),
+        "Хачапури мини": (340, "100 г", 15),
+        "Брускетта с томатами": (250, "100 г", 8),
+        "Круассан с лососем": (390, "100 г", 10),
+        "Овощной ролл": (230, "100 г", 7),
+        "Суп дня": (260, "100 г", 12),
+    },
+    "Сыры": {
+        "Бри": (340, "100 г", 3),
+        "Камамбер": (360, "100 г", 3),
+        "Выдержанная гауда": (280, "100 г", 3),
+        "Пармезан": (420, "100 г", 3),
+        "Дорблю": (450, "100 г", 3),
+        "Чеддер": (300, "100 г", 3),
+        "Козий сыр": (380, "100 г", 3),
+        "Сулугуни": (240, "100 г", 3),
+    },
+}
+
+users_db = {}
+tea_menu = {}
+active_orders = []
+extended_view = False
+stock = {}
+
+
+def execute(query, params=()):
+    db = sqlite3.connect(DB_FILE)
+    try:
+        db.execute(query, params)
+        db.commit()
+    finally:
+        db.close()
+
+
+def execute_many(query, rows):
+    db = sqlite3.connect(DB_FILE)
+    try:
+        db.executemany(query, rows)
+        db.commit()
+    finally:
+        db.close()
+
+
+def fetch_all(query, params=()):
+    db = sqlite3.connect(DB_FILE)
+    try:
+        return db.execute(query, params).fetchall()
+    finally:
+        db.close()
+
+
+def init_database():
+    execute("CREATE TABLE IF NOT EXISTS users (login TEXT PRIMARY KEY, password_hash TEXT NOT NULL, balance INTEGER NOT NULL)")
+    execute("CREATE TABLE IF NOT EXISTS menu (section TEXT NOT NULL, item TEXT NOT NULL, price INTEGER NOT NULL, unit TEXT NOT NULL, minutes INTEGER NOT NULL, PRIMARY KEY (section, item))")
+    execute("CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, login TEXT NOT NULL, section TEXT NOT NULL, item TEXT NOT NULL, qty INTEGER NOT NULL, price INTEGER NOT NULL, hall TEXT NOT NULL, minutes INTEGER NOT NULL, ready_at REAL NOT NULL, status TEXT NOT NULL)")
+    execute("CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, login TEXT NOT NULL, content TEXT NOT NULL)")
+    execute("CREATE TABLE IF NOT EXISTS ingredients (name TEXT PRIMARY KEY, amount INTEGER NOT NULL, minimum INTEGER NOT NULL)")
+
+
+def load_database():
+    global users_db
+    users_db = {login: {"password_hash": ph, "balance": balance}
+                for login, ph, balance in fetch_all("SELECT login, password_hash, balance FROM users")}
+
+
+def save_user(login):
+    data = users_db[login]
+    execute("INSERT OR REPLACE INTO users (login, password_hash, balance) VALUES (?, ?, ?)",
+            (login, data["password_hash"], data["balance"]))
+
+
+def load_menu():
+    global tea_menu
+    tea_menu = {}
+    for section, item, price, unit, minutes in fetch_all("SELECT section, item, price, unit, minutes FROM menu"):
+        tea_menu.setdefault(section, {})[item] = (price, unit, minutes)
+    if not tea_menu:
+        tea_menu = {section: items.copy() for section, items in default_menu.items()}
+    for section, items in tea_menu.items():
+        for item, (price, unit, minutes) in list(items.items()):
+            if unit == "порция":
+                items[item] = (price, "100 г", minutes)
+    save_menu()
+
+
+def save_menu():
+    execute("DELETE FROM menu")
+    rows = [(section, item, price, unit, minutes)
+            for section, items in tea_menu.items()
+            for item, (price, unit, minutes) in items.items()]
+    execute_many("INSERT INTO menu (section, item, price, unit, minutes) VALUES (?, ?, ?, ?, ?)", rows)
+
+
+def load_stock():
+    global stock
+    stock = {name: (amount, minimum)
+             for name, amount, minimum in fetch_all("SELECT name, amount, minimum FROM ingredients")}
+    for name, value in default_stock().items():
+        stock.setdefault(name, value)
+    save_stock()
+
+
+def save_stock():
+    execute("DELETE FROM ingredients")
+    execute_many("INSERT INTO ingredients (name, amount, minimum) VALUES (?, ?, ?)",
+                 [(name, amount, minimum) for name, (amount, minimum) in stock.items()])
+
+
+def ask_int(prompt, low, high):
+    try:
+        value = int(input(prompt))
+    except ValueError:
+        print("Нужно ввести число.")
+        return None
+    if not low <= value <= high:
+        print(f"Допустимо от {low} до {high}.")
+        return None
+    return value
+
+
+def visible_items(section, reveal=False):
+    items = tea_menu.get(section, {})
+    if reveal:
+        return list(items.items())
+    return [(item, data) for item, data in items.items() if can_make(stock, item, 1)]
+
+
+def show_sections():
+    print("\n-------- РАЗДЕЛЫ МЕНЮ --------")
+    for number, section in enumerate(tea_menu, start=1):
+        print(f"{number}. {section} ({len(tea_menu[section])} поз.)")
+
+
+def show_section_items(section, reveal=False):
+    rows = visible_items(section, reveal)
+    print(f"\n--- {section.upper()} ---")
+    if not rows:
+        print("Нет доступных позиций.")
+        return
+    for number, (item, (price, unit, minutes)) in enumerate(rows, start=1):
+        print(f"{number}. {item} - {price} руб. / {unit} ({minutes} мин)")
+        if reveal and composition(item):
+            print(f"   состав: {composition(item)}")
+
+
+def show_full_menu(reveal=False):
+    if not tea_menu:
+        print("Меню пустое.")
+        return
+    shown = 0
+    for section in tea_menu:
+        rows = visible_items(section, reveal)
+        if rows:
+            show_section_items(section, reveal)
+            shown += len(rows)
+    print(f"\nДоступно позиций: {shown}")
+
+
+def pick_section(reveal=False):
+    sections = [section for section in tea_menu if visible_items(section, reveal)]
+    if not sections:
+        print("Сейчас нет доступных разделов.")
+        return None
+    print("\n-------- РАЗДЕЛЫ МЕНЮ --------")
+    for number, section in enumerate(sections, start=1):
+        print(f"{number}. {section} ({len(visible_items(section, reveal))} поз.)")
+    print("0. Назад")
+    choice = input("Выбери раздел: ").strip()
+    if choice == "0":
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(sections):
+        return sections[int(choice) - 1]
+    print("Такого раздела нет.")
+    return None
+
+
+def choose_item():
+    while True:
+        section = pick_section()
+        if not section:
+            return None
+        if section == CEREMONY_SECTION:
+            print("Церемонии бронируются отдельным пунктом меню.")
+            continue
+        while True:
+            rows = visible_items(section)
+            show_section_items(section)
+            print("0. Назад к разделам")
+            choice = input("Выбери позицию: ").strip()
+            if choice == "0":
+                break
+            if choice.isdigit() and 1 <= int(choice) <= len(rows):
+                item, (price, unit, minutes) = rows[int(choice) - 1]
+                return section, item, price, unit, minutes
+            print("Такой позиции нет в разделе.")
+
+
+def choose_ceremony():
+    items = tea_menu.get(CEREMONY_SECTION, {})
+    if not items:
+        print("Церемоний сейчас нет в меню.")
+        return None
+    show_section_items(CEREMONY_SECTION)
+    print("0. Назад")
+    choice = input("Выбери церемонию: ").strip()
+    if choice == "0":
+        return None
+    names = list(items)
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        item = names[int(choice) - 1]
+        price, unit, minutes = items[item]
+        return item, price, minutes
+    print("Такой церемонии нет.")
+    return None
+
+
+def busy_halls():
+    return {order["hall"] for order in active_orders if order["section"] == CEREMONY_SECTION}
+
+
+def show_halls():
+    busy = busy_halls()
+    print("\n-------- ЗАЛЫ ДЛЯ ЦЕРЕМОНИЙ --------")
+    for hall, capacity in HALLS.items():
+        if hall in busy:
+            order = next(o for o in active_orders if o["hall"] == hall)
+            left = max(0, int((order["ready_time"] - time.time()) / MINUTE_LENGTH))
+            print(f"{hall} (до {capacity} гостей): занят, осталось {left} мин")
+        else:
+            print(f"{hall} (до {capacity} гостей): свободен")
+
+
+def load_active_orders():
+    global active_orders
+    active_orders = [{"id": oid, "user": login, "section": section, "item": item, "qty": qty,
+                      "price": price, "hall": hall, "minutes": minutes, "ready_time": ready}
+                     for oid, login, section, item, qty, price, hall, minutes, ready in
+                     fetch_all("SELECT id, login, section, item, qty, price, hall, minutes, ready_at FROM orders WHERE status = 'active'")]
+
+
+def add_order_to_database(order):
+    execute("INSERT INTO orders (id, login, section, item, qty, price, hall, minutes, ready_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+            (order["id"], order["user"], order["section"], order["item"], order["qty"],
+             order["price"], order["hall"], order["minutes"], order["ready_time"]))
+
+
+def generate_receipt_id():
+    while True:
+        receipt_id = f"TEA-{int(time.time())}-{random.randint(100000, 999999)}"
+        if not fetch_all("SELECT id FROM orders WHERE id = ?", (receipt_id,)):
+            return receipt_id
+
+
+def save_receipt(login, receipt_id, content):
+    execute("INSERT INTO receipts (id, login, content) VALUES (?, ?, ?)", (receipt_id, login, content))
+    with open(f"{login}{RECEIPT_SUFFIX}", "a", encoding="utf-8") as file:
+        file.write(content + "\n---\n")
+
+
+def get_receipts(login):
+    return [row[0] for row in fetch_all("SELECT content FROM receipts WHERE login = ? ORDER BY rowid", (login,))]
+
+
+def timer(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        return result, round(time.time() - start_time, 4)
+    return wrapper
+
+
+def check_login(func):
+    @wraps(func)
+    def wrapper(login, *args, **kwargs):
+        if login not in users_db:
+            print(f"Пользователь '{login}' не найден в базе данных.")
+            return None
+        return func(login, *args, **kwargs)
+    return wrapper
+
+
+def admin_only(func):
+    @wraps(func)
+    def wrapper(login, *args, **kwargs):
+        if login != ADMIN_LOGIN or login not in users_db:
+            print("Доступ запрещен: нужны права администратора.")
+            return None
+        return func(login, *args, **kwargs)
+    return wrapper
+
+
+def place_order(login, section, item, qty, price, hall, minutes, unit):
+    total = price * qty
+    if not can_make(stock, item, qty):
+        print("Сейчас этого нет в наличии: закончились ингредиенты. Выбери другую позицию.")
+        return
+    if users_db[login]["balance"] < total:
+        print(f"Недостаточно денег. Нужно {total} руб., у вас {users_db[login]['balance']} руб.")
+        return
+    users_db[login]["balance"] -= total
+    save_user(login)
+    consume(stock, item, qty)
+    save_stock()
+    order = {"id": generate_receipt_id(), "user": login, "section": section, "item": item,
+             "qty": qty, "price": total, "hall": hall, "minutes": minutes,
+             "ready_time": time.time() + minutes * MINUTE_LENGTH}
+    active_orders.append(order)
+    add_order_to_database(order)
+    print(f"Принято. Номер: {order['id']}")
+    if section == CEREMONY_SECTION:
+        print(f"Церемония '{item}', зал '{hall}', гостей: {qty}, длительность {minutes} мин.")
+        print("Зал занят до конца церемонии, другие залы можно бронировать параллельно.")
+    else:
+        print(f"{item}: {qty} x {price} руб. / {unit}. Итого {total} руб.")
+        print(f"Готовность через {minutes} мин.")
+    print(f"Остаток на балансе: {users_db[login]['balance']} руб.")
+
+
+def buy_goods(login):
+    selected = choose_item()
+    if not selected:
+        return
+    section, item, price, unit, minutes = selected
+    qty = ask_int(f"Сколько взять ({unit})? ", 1, 50)
+    if qty is None:
+        return
+    place_order(login, section, item, qty, price, "", minutes, unit)
+
+
+def book_ceremony(login):
+    selected = choose_ceremony()
+    if not selected:
+        return
+    item, price, minutes = selected
+    guests = ask_int("Сколько гостей? ", 1, max(HALLS.values()))
+    if guests is None:
+        return
+    busy = busy_halls()
+    available = [hall for hall, capacity in HALLS.items() if capacity >= guests and hall not in busy]
+    if not available:
+        print("Свободных залов под такое количество гостей сейчас нет.")
+        show_halls()
+        return
+    print("\nСвободные залы:")
+    for number, hall in enumerate(available, start=1):
+        print(f"{number}. {hall} (до {HALLS[hall]} гостей)")
+    choice = ask_int("Выбери зал: ", 1, len(available))
+    if choice is None:
+        return
+    hall = available[choice - 1]
+    print(f"Цена {price} руб. за гостя, всего {price * guests} руб., длительность {minutes} мин.")
+    if input("Подтвердить бронь? (y/n): ").strip().lower() != "y":
+        print("Бронь отменена.")
+        return
+    place_order(login, CEREMONY_SECTION, item, guests, price, hall, minutes, "гость")
+
+
+@timer
+def process_orders_logic():
+    current_time = time.time()
+    completed = []
+    for order in list(active_orders):
+        if current_time >= order["ready_time"]:
+            active_orders.remove(order)
+            execute("UPDATE orders SET status = 'done' WHERE id = ?", (order["id"],))
+            completed.append(order)
+    return completed
+
+
+def show_completed_orders(completed):
+    for order in completed:
+        if order["section"] == CEREMONY_SECTION:
+            print(f"[{order['id']}] Церемония '{order['item']}' в зале '{order['hall']}' завершена.")
+            details = (f"ЗАЛ: {order['hall']}\n"
+                       f"ГОСТЕЙ: {order['qty']}\n"
+                       f"ДЛИТЕЛЬНОСТЬ: {order['minutes']} мин\n")
+            status = "ЦЕРЕМОНИЯ ЗАВЕРШЕНА"
+        else:
+            print(f"[{order['id']}] {order['item']} для {order['user']} готово к выдаче.")
+            details = f"КОЛИЧЕСТВО: {order['qty']}\n"
+            status = "ВЫДАНО"
+        content = (f"ЧЕК N {order['id']}\n"
+                   f"{HOUSE_NAME.upper()}\n"
+                   f"КЛИЕНТ: {order['user']}\n"
+                   f"РАЗДЕЛ: {order['section']}\n"
+                   f"ПОЗИЦИЯ: {order['item']}\n"
+                   f"{details}"
+                   f"ИТОГО: {order['price']} руб.\n"
+                   f"СТАТУС: {status}\n"
+                   f"ВРЕМЯ: {time.strftime('%d.%m.%Y %H:%M:%S')}")
+        print("-" * 34)
+        print(content)
+        print("-" * 34)
+        save_receipt(order["user"], order["id"], content)
+
+
+def create_admin():
+    if ADMIN_LOGIN in users_db:
+        return
+    print("\nПервый запуск: придумайте пароль администратора чайного тауна.")
+    while True:
+        password = input("Пароль администратора: ").strip()
+        repeat = input("Повторите пароль: ").strip()
+        if len(password) < 4:
+            print("Пароль должен быть не короче 4 символов.")
+            continue
+        if password != repeat:
+            print("Пароли не совпадают.")
+            continue
+        break
+    users_db[ADMIN_LOGIN] = {"password_hash": hash_password(password), "balance": 50000}
+    save_user(ADMIN_LOGIN)
+    print("Администратор создан. В базе сохранен только хеш пароля.")
+
+
+def add_user():
+    print("\n--- Создание новой учетной записи ---")
+    user_login = input("Введи имя пользователя: ").strip()
+    if not user_login or ";" in user_login:
+        print("Некорректное имя.")
+        return
+    if user_login in users_db:
+        print("Такой гость уже зарегистрирован!")
+        return
+    user_password = input("Введи пароль для учетной записи: ").strip()
+    if len(user_password) < 4:
+        print("Пароль должен быть не короче 4 символов.")
+        return
+    users_db[user_login] = {"password_hash": hash_password(user_password), "balance": 0}
+    save_user(user_login)
+    print("Учетная запись успешно создана!")
+
+
+def change_user():
+    print("\n--- Изменение учетной записи ---")
+    input_login = input("Введи свой логин: ").strip()
+    input_password = input("Введи свой пароль: ").strip()
+    if input_login not in users_db or not verify_password(input_password, users_db[input_login]["password_hash"]):
+        print("Неверный логин или пароль.")
+        return
+    new_login = input("Введи новое имя пользователя: ").strip()
+    new_password = input("Введи новый пароль: ").strip()
+    if not new_login or len(new_password) < 4:
+        print("Некорректные новые данные.")
+        return
+    if input_login == ADMIN_LOGIN and new_login != ADMIN_LOGIN:
+        print("Логин администратора менять нельзя.")
+        return
+    if new_login != input_login and new_login in users_db:
+        print("Такой логин уже занят.")
+        return
+    user_data = users_db.pop(input_login)
+    user_data["password_hash"] = hash_password(new_password)
+    users_db[new_login] = user_data
+    execute("DELETE FROM users WHERE login = ?", (input_login,))
+    save_user(new_login)
+    execute("UPDATE orders SET login = ? WHERE login = ?", (new_login, input_login))
+    execute("UPDATE receipts SET login = ? WHERE login = ?", (new_login, input_login))
+    for order in active_orders:
+        if order["user"] == input_login:
+            order["user"] = new_login
+    old_file = f"{input_login}{RECEIPT_SUFFIX}"
+    new_file = f"{new_login}{RECEIPT_SUFFIX}"
+    if old_file != new_file and os.path.exists(old_file):
+        os.rename(old_file, new_file)
+    print("Данные учетки изменены!")
+
+
+def delete_user():
+    print("\n!!! Перед удалением аккаунта авторизируйтесь в нем !!!")
+    input_login = input("Введи свой логин: ").strip()
+    input_password = input("Введи свой пароль: ").strip()
+    if input_login not in users_db or not verify_password(input_password, users_db[input_login]["password_hash"]):
+        print("Неверный логин или пароль.")
+        return
+    if input_login == ADMIN_LOGIN:
+        print("!!! Учетную запись Admin удалить нельзя !!!")
+        return
+    if input("Вы действительно хотите удалить учетку? (y/n): ").strip().lower() != "y":
+        print("Удаление отменено.")
+        return
+    balance = users_db.pop(input_login)["balance"]
+    execute("DELETE FROM users WHERE login = ?", (input_login,))
+    execute("DELETE FROM orders WHERE login = ?", (input_login,))
+    execute("DELETE FROM receipts WHERE login = ?", (input_login,))
+    filename = f"{input_login}{RECEIPT_SUFFIX}"
+    if os.path.exists(filename):
+        os.remove(filename)
+    print(f"Заберите деньги со счета: {balance} руб.")
+    time.sleep(1)
+    print("Учетка удалена.")
+
+
+def show_orders(limit=None, with_receipts=False):
+    rows = fetch_all("SELECT id, login, section, item, qty, hall, price, status FROM orders ORDER BY rowid DESC")
+    total = len(rows)
+    if limit is not None:
+        rows = rows[:limit]
+    if not rows:
+        print("Заказов пока нет.")
+        return
+    print(f"\n--- ЗАКАЗЫ И ЦЕРЕМОНИИ: показано {len(rows)} из {total} ---")
+    for number, (oid, user, section, item, qty, hall, price, status) in enumerate(rows, start=1):
+        place = f", зал {hall}" if hall else ""
+        print(f"{number}. [{oid}] {user}: [{section}] {item} x{qty}{place}, {price} руб. [{status}]")
+        if with_receipts:
+            receipt = fetch_all("SELECT content FROM receipts WHERE id = ?", (oid,))
+            print("-" * 34)
+            if receipt:
+                print(receipt[0][0])
+            else:
+                print("Чек еще не сформирован: заказ в работе.")
+            print("-" * 34)
+
+
+@admin_only
+def admin_account_menu(login):
+    global extended_view
+    while True:
+        print(f"\n-------- АДМИНИСТРАТОР: {HOUSE_NAME} --------")
+        low = shortages(stock)
+        if low:
+            print(f"ВНИМАНИЕ: ингредиентов ниже минимума: {len(low)}. Открой пункт 10.")
+        print("0. Выход")
+        if extended_view:
+            print("1. ВСЕ заказы и чеки к ним")
+        else:
+            print(f"1. Последние {LAST_ORDERS_LIMIT} заказов")
+        print("2. Добавить / изменить позицию")
+        print("3. Удалить позицию")
+        print("4. Балансы гостей")
+        print("5. Загрузка кухни и залов")
+        print("6. Меню по разделам с составами")
+        print("7. Выручка заведения")
+        print(f"8. Расширенный просмотр: {'ВКЛ' if extended_view else 'ВЫКЛ'}")
+        print("9. Склад: все ингредиенты")
+        print("10. Что нужно закупить")
+        print("11. Пополнить / изменить остаток")
+        choice = input("Выбери действие: ").strip()
+
+        if choice == "0":
+            print("Выход из админ-панели...")
+            time.sleep(1)
+            break
+
+        elif choice == "1":
+            if extended_view:
+                show_orders(with_receipts=True)
+            else:
+                show_orders(limit=LAST_ORDERS_LIMIT)
+                print(f"Показаны только {LAST_ORDERS_LIMIT} последних заказов. Включи пункт 8, чтобы увидеть все заказы и чеки.")
+
+        elif choice == "2":
+            show_sections()
+            print(f"{len(tea_menu) + 1}. Создать новый раздел")
+            section_choice = input("Выбери раздел: ").strip()
+            if section_choice == str(len(tea_menu) + 1):
+                section = input("Название нового раздела: ").strip()
+                if not section:
+                    print("Название раздела не может быть пустым.")
+                    continue
+            elif section_choice.isdigit() and 1 <= int(section_choice) <= len(tea_menu):
+                section = list(tea_menu)[int(section_choice) - 1]
+            else:
+                print("Такого раздела нет.")
+                continue
+            if section in tea_menu:
+                show_section_items(section, True)
+            item_name = input("\nНазвание позиции: ").strip()
+            if not item_name:
+                print("Название не может быть пустым.")
+                continue
+            price = ask_int("Цена: ", 0, 1000000)
+            if price is None:
+                continue
+            unit = input("Единица (шт, 50 г, 100 г, набор, гость): ").strip() or "шт"
+            minutes = ask_int("Время подготовки или длительность в минутах: ", 0, 600)
+            if minutes is None:
+                continue
+            tea_menu.setdefault(section, {})[item_name] = (price, unit, minutes)
+            save_menu()
+            print(f"Раздел '{section}': позиция '{item_name}' сохранена в базе данных.")
+            if item_name not in RECIPES:
+                print("У позиции нет рецепта в storage.py, склад по ней не расходуется.")
+
+        elif choice == "3":
+            section = pick_section(True)
+            if not section:
+                continue
+            show_section_items(section, True)
+            item_name = input("\nНазвание позиции для удаления: ").strip()
+            if item_name in tea_menu[section]:
+                tea_menu[section].pop(item_name)
+                if not tea_menu[section]:
+                    tea_menu.pop(section)
+                    print(f"Раздел '{section}' опустел и удален из меню.")
+                save_menu()
+                print("Позиция удалена из базы данных.")
+            else:
+                print("Такой позиции нет в разделе.")
+
+        elif choice == "4":
+            print("\n--- БАЛАНСЫ ГОСТЕЙ ---")
+            for user, data in users_db.items():
+                print(f"{user}: {data['balance']} руб.")
+
+        elif choice == "5":
+            print(f"\nАктивных заказов и церемоний: {len(active_orders)}")
+            for order in active_orders:
+                left = max(0, int((order["ready_time"] - time.time()) / MINUTE_LENGTH))
+                place = f", зал {order['hall']}" if order["hall"] else ""
+                print(f"{order['id']}: [{order['section']}] {order['item']} для {order['user']}{place}, осталось {left} мин")
+            show_halls()
+
+        elif choice == "6":
+            show_full_menu(reveal=True)
+
+        elif choice == "7":
+            total = fetch_all("SELECT SUM(price) FROM orders WHERE status = 'done'")[0][0] or 0
+            count = fetch_all("SELECT COUNT(*) FROM orders WHERE status = 'done'")[0][0]
+            print(f"\nЗавершено заказов и церемоний: {count}")
+            print(f"Выручка: {total} руб.")
+
+        elif choice == "8":
+            extended_view = not extended_view
+            if extended_view:
+                print("Расширенный просмотр включен: пункт 1 покажет все заказы и чеки к ним.")
+            else:
+                print(f"Расширенный просмотр выключен: пункт 1 покажет только {LAST_ORDERS_LIMIT} последних заказов.")
+            time.sleep(1)
+
+        elif choice == "9":
+            print("\n--- СКЛАД: ВСЕ ИНГРЕДИЕНТЫ ---")
+            for name, (amount, minimum) in sorted(stock.items()):
+                mark = "  НУЖНА ЗАКУПКА" if amount <= minimum else ""
+                print(f"{name}: {amount} г, минимум {minimum} г{mark}")
+            print(f"Всего наименований: {len(stock)}")
+
+        elif choice == "10":
+            print("\n--- ЧТО НУЖНО ЗАКУПИТЬ ---")
+            if low:
+                for name, amount, minimum in sorted(low):
+                    print(f"{name}: осталось {amount} г при минимуме {minimum} г, докупить {max(0, minimum * 4 - amount)} г")
+            else:
+                print("Все ингредиенты в норме, закупка не требуется.")
+            blocked = blocked_items(stock, tea_menu)
+            if blocked:
+                print("\nПозиции, скрытые от гостей:")
+                for section, item, missing in blocked:
+                    print(f"[{section}] {item}: не хватает {', '.join(missing)}")
+            else:
+                print("Все позиции меню доступны гостям.")
+
+        elif choice == "11":
+            names = sorted(stock)
+            for number, name in enumerate(names, start=1):
+                amount, minimum = stock[name]
+                print(f"{number}. {name}: {amount} г (минимум {minimum} г)")
+            index = ask_int("Номер ингредиента: ", 1, len(names))
+            if index is None:
+                continue
+            name = names[index - 1]
+            new_amount = ask_int("Новый остаток в граммах: ", 0, 1000000)
+            if new_amount is None:
+                continue
+            stock[name] = (new_amount, stock[name][1])
+            save_stock()
+            print(f"{name}: остаток {new_amount} г сохранен.")
+
+        else:
+            print("Неверный ввод.")
+
+
+@check_login
+def user_account_menu(login):
+    while login in users_db:
+        print(f"\n-------- ГОСТЬ: {login} | Баланс: {users_db[login]['balance']} руб. --------")
+        print("0. Выход")
+        print("1. Разделы меню")
+        print("2. Показать все меню")
+        print("3. Купить чай, посуду или угощения")
+        print("4. Забронировать чайную церемонию")
+        print("5. Залы: свободные и занятые")
+        print("6. Мои чеки")
+        print("7. Пополнить баланс")
+        print("8. Забрать готовое и завершить церемонии")
+        choice = input("Выбор: ").strip()
+
+        if choice == "0":
+            print("Выход из аккаунта...")
+            time.sleep(1)
+            break
+
+        elif choice == "1":
+            if not tea_menu:
+                print("Меню пустое.")
+                continue
+            section = pick_section()
+            if section:
+                show_section_items(section)
+
+        elif choice == "2":
+            show_full_menu()
+
+        elif choice == "3":
+            if not tea_menu:
+                print("Меню пустое.")
+                continue
+            buy_goods(login)
+
+        elif choice == "4":
+            book_ceremony(login)
+
+        elif choice == "5":
+            show_halls()
+
+        elif choice == "6":
+            receipts = get_receipts(login)
+            print("\n--- МОИ ЧЕКИ ---" if receipts else "Чеков пока нет.")
+            for content in receipts:
+                print(content)
+                print("-" * 34)
+
+        elif choice == "7":
+            amount = ask_int("Сумма пополнения: ", 1, 1000000)
+            if amount is None:
+                continue
+            users_db[login]["balance"] += amount
+            save_user(login)
+            print(f"Баланс пополнен. Текущий баланс: {users_db[login]['balance']} руб.")
+
+        elif choice == "8":
+            results, duration = process_orders_logic()
+            if results:
+                print("\n=== ГОТОВО ===")
+                show_completed_orders(results)
+                print(f"Проверка заняла {duration} сек.")
+            else:
+                print(f"Пока ничего не готово. В работе: {len(active_orders)}")
+
+        else:
+            print("Неверное действие.")
+
+
+def login_user():
+    print("\n--- Вход в систему ---")
+    input_login = input("Введи свой логин: ").strip()
+    input_password = input("Введи свой пароль: ").strip()
+    if input_login in users_db and verify_password(input_password, users_db[input_login]["password_hash"]):
+        print("Успешный вход!")
+        if input_login == ADMIN_LOGIN:
+            admin_account_menu(input_login)
+        else:
+            user_account_menu(input_login)
+    else:
+        print("Неверный логин или пароль.")
+
+
+def main():
+    init_database()
+    load_database()
+    create_admin()
+    load_menu()
+    load_stock()
+    load_active_orders()
+    print(f"Добро пожаловать в {HOUSE_NAME}!")
+    print(f"Демо-режим времени: 1 минута заведения = {MINUTE_LENGTH} сек реального времени.")
+
+    while True:
+        print("\n------- Главное Меню -------")
+        print("0. Выход")
+        print("1. Создать учётку")
+        print("2. Изменить учётку")
+        print("3. Удалить учётку")
+        print("4. Войти в учетку")
+        make = input("Выбери действие: ").strip()
+
+        if make == "0":
+            print("Чайный таун закрывается. До встречи!")
+            break
+        elif make == "1":
+            add_user()
+        elif make == "2":
+            change_user()
+        elif make == "3":
+            delete_user()
+        elif make == "4":
+            login_user()
+        else:
+            print("Повтори попытку")
+
+
+if __name__ == "__main__":
+    main()
